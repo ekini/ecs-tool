@@ -12,8 +12,8 @@ builds:
       - amd64
       - arm64
 nfpms:
-  - vendor: Springload
-    homepage: https://springload.co.nz
+  - vendor: Ekini
+    homepage: https://github.com/ekini/ecs-tool
 
     maintainer: DevOps team
     description: Runs commands on ECS cluster
@@ -21,10 +21,3 @@ nfpms:
     formats:
       - deb
       - rpm
-
-brews:
-  - name: ecs-tool
-    repository:
-      owner: springload
-      name: homebrew-tools
-    directory: Formula
