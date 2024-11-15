@@ -8,6 +8,7 @@ import (
 	"github.com/apex/log"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/samber/lo"
 )
 
 // DeployServices deploys specified services in parallel
@@ -124,6 +125,7 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 
 	wg.Add(1)
 	go func(ctx log.Interface, cluster, service string) {
+		printedEvents := []string{}
 		last := time.Now()
 
 		defer wg.Done()
@@ -131,31 +133,30 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
-		printEvent := func(last time.Time) time.Time {
+		printEvent := func() {
 			describeResult, err := svc.DescribeServices(&ecs.DescribeServicesInput{
 				Cluster:  aws.String(cluster),
 				Services: aws.StringSlice([]string{service}),
 			})
 			if err != nil {
 				ctx.WithError(err).Error("Can't describe service")
-				return last
 			}
 			for _, event := range describeResult.Services[0].Events {
-				if !aws.TimeValue(event.CreatedAt).Before(last) {
+				eventId := aws.StringValue(event.Id)
+				if !aws.TimeValue(event.CreatedAt).Before(last) && !lo.Contains(printedEvents, eventId) {
 					ctx.Info(aws.StringValue(event.Message))
-					last = aws.TimeValue(event.CreatedAt)
+					printedEvents = lo.Union(printedEvents, []string{eventId})
 				}
-			}
 
-			return last
+			}
 		}
 		for {
 			select {
 			case <-doneChan:
-				printEvent(last)
+				printEvent()
 				return
 			case <-ticker.C:
-				last = printEvent(last)
+				printEvent()
 			}
 		}
 	}(ctx, cluster, service)
@@ -207,7 +208,6 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	if err != nil {
 		ctx.WithError(err).Error("Can't deregister task definition")
 	}
-
 }
 
 func updateService(ctx log.Interface, cluster, service, taskDefinition string) error {
