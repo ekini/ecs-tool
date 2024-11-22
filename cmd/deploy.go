@@ -44,6 +44,7 @@ If deployment failed, then rolls back to the previous stack definition.`,
 			viper.GetStringSlice("image_tags"),
 			viper.GetStringSlice("deploy.services"),
 			viper.GetString("workdir"),
+			!viper.GetBool("no_rollback"),
 		)
 		if err != nil {
 			log.WithError(err).Errorf("Deployment failed with code %d", exitCode)
@@ -56,6 +57,10 @@ func init() {
 	rootCmd.AddCommand(deployCmd)
 	deployCmd.PersistentFlags().StringSliceP("service", "s", []string{}, "Names of services to update. Can be specified multiple times for parallel deployment")
 	if err := viper.BindPFlag("deploy.services", deployCmd.PersistentFlags().Lookup("service")); err != nil {
+		log.WithError(err).Fatal("can't bind flag to config")
+	}
+	deployCmd.PersistentFlags().BoolP("no-rollback", "", false, "Do not rollback when a deployment fails. ECS has its own mechanisms now.")
+	if err := viper.BindPFlag("no_rollback", deployCmd.PersistentFlags().Lookup("no-rollback")); err != nil {
 		log.WithError(err).Fatal("can't bind flag to config")
 	}
 }

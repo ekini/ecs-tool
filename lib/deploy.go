@@ -12,7 +12,7 @@ import (
 )
 
 // DeployServices deploys specified services in parallel
-func DeployServices(profile, cluster, imageTag string, imageTags, services []string, workDir string) (exitCode int, err error) {
+func DeployServices(profile, cluster, imageTag string, imageTags, services []string, workDir string, rollbackOnFail bool) (exitCode int, err error) {
 	ctx := log.WithFields(log.Fields{
 		"cluster":   cluster,
 		"image_tag": imageTag,
@@ -43,7 +43,7 @@ func DeployServices(profile, cluster, imageTag string, imageTags, services []str
 	}
 	if exitCode != 0 {
 		for n := 0; n < len(services); n++ {
-			rollback <- true
+			rollback <- rollbackOnFail
 		}
 	} else {
 		close(rollback)
