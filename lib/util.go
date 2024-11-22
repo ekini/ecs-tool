@@ -1,30 +1,25 @@
 package lib
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/apex/log"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 )
 
-var localSession *session.Session
+var cfg aws.Config
 
-func makeSession(profile string) error {
-	if localSession == nil {
-		log.Debug("Creating session")
+func makeConfig(profile string) error {
+	if cfg.Region == "" {
+		log.Debug("Creating config")
 		var err error
-		// create AWS session
-		localSession, err = session.NewSessionWithOptions(session.Options{
-			Config: aws.Config{},
-
-			SharedConfigState: session.SharedConfigEnable,
-			Profile:           profile,
-		})
+		cfg, err = config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile(profile))
 		if err != nil {
 			return fmt.Errorf("can't get aws session")
 		}
@@ -32,8 +27,8 @@ func makeSession(profile string) error {
 	return nil
 }
 
-func parseTaskUUID(containerArn *string) (string, error) {
-	resourceArn, err := arn.Parse(aws.StringValue(containerArn))
+func parseTaskUUID(containerArn string) (string, error) {
+	resourceArn, err := arn.Parse(containerArn)
 	if err != nil {
 		return "", err
 	}
@@ -49,27 +44,30 @@ func parseTaskUUID(containerArn *string) (string, error) {
 }
 
 func printCloudWatchLogs(logGroup, streamName string) error {
-	logs := cloudwatchlogs.New(localSession)
-	err := logs.GetLogEventsPages(
+	logs := cloudwatchlogs.NewFromConfig(cfg)
+	paginator := cloudwatchlogs.NewGetLogEventsPaginator(
+		logs,
 		&cloudwatchlogs.GetLogEventsInput{
 			LogGroupName: aws.String(logGroup),
 			// prefix-name/container-name/ecs-task-id
 			LogStreamName: aws.String(streamName),
 		},
-		func(page *cloudwatchlogs.GetLogEventsOutput, lastPage bool) bool {
-			if len(page.Events) > 0 {
-				for _, event := range page.Events {
-					fmt.Println(aws.StringValue(event.Message))
-				}
-			}
-			return true
-		})
-	return err
-
+	)
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(context.TODO())
+		if err != nil {
+			return err
+		}
+		for _, event := range page.Events {
+			fmt.Println(aws.ToString(event.Message))
+		}
+	}
+	return nil
 }
+
 func deleteCloudWatchStream(logGroup, streamName string) error {
-	logs := cloudwatchlogs.New(localSession)
-	_, err := logs.DeleteLogStream(&cloudwatchlogs.DeleteLogStreamInput{
+	logs := cloudwatchlogs.NewFromConfig(cfg)
+	_, err := logs.DeleteLogStream(context.TODO(), &cloudwatchlogs.DeleteLogStreamInput{
 		LogGroupName:  aws.String(logGroup),
 		LogStreamName: aws.String(streamName),
 	})
@@ -94,11 +92,10 @@ func fetchCloudWatchLog(cluster, containerName, awslogGroup, taskUUID string, de
 	return printCloudWatchLogs(awslogGroup, streamName)
 }
 
-func modifyContainerDefinitionImages(imageTag string, imageTags []string, workDir string, containerDefinitions []*ecs.ContainerDefinition, ctx log.Interface) error {
-
+func modifyContainerDefinitionImages(imageTag string, imageTags []string, workDir string, containerDefinitions []ecsTypes.ContainerDefinition, ctx log.Interface) error {
 	for n, containerDefinition := range containerDefinitions {
-		ctx := ctx.WithField("container_name", aws.StringValue(containerDefinition.Name))
-		imageWithTag := strings.SplitN(aws.StringValue(containerDefinition.Image), ":", 2)
+		ctx := ctx.WithField("container_name", aws.ToString(containerDefinition.Name))
+		imageWithTag := strings.SplitN(aws.ToString(containerDefinition.Image), ":", 2)
 
 		if len(imageWithTag) == 2 { // successfully split into 2 parts: repo and tag
 			var newTag string // if set we'll change the definition
@@ -110,7 +107,7 @@ func modifyContainerDefinitionImages(imageTag string, imageTags []string, workDi
 
 			if newTag != "" {
 				// replace some [arams
-				newTag = strings.Replace(newTag, "{container_name}", aws.StringValue(containerDefinition.Name), -1)
+				newTag = strings.Replace(newTag, "{container_name}", aws.ToString(containerDefinition.Name), -1)
 				image := strings.Join([]string{
 					imageWithTag[0],
 					newTag,

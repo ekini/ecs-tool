@@ -1,13 +1,14 @@
 package lib
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/apex/log"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/samber/lo"
 )
 
@@ -18,7 +19,7 @@ func DeployServices(profile, cluster, imageTag string, imageTags, services []str
 		"image_tag": imageTag,
 	})
 
-	err = makeSession(profile)
+	err = makeConfig(profile)
 	if err != nil {
 		return 1, err
 	}
@@ -59,12 +60,12 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	})
 	ctx.Info("Deploying")
 
-	svc := ecs.New(localSession)
+	svc := ecs.NewFromConfig(cfg)
 
 	// first, describe the service to get current task definition
-	describeResult, err := svc.DescribeServices(&ecs.DescribeServicesInput{
+	describeResult, err := svc.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
 		Cluster:  aws.String(cluster),
-		Services: aws.StringSlice([]string{service}),
+		Services: []string{service},
 	})
 	if err != nil {
 		ctx.WithError(err).Error("Can't describe service")
@@ -73,14 +74,14 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	}
 	if len(describeResult.Failures) > 0 {
 		for _, failure := range describeResult.Failures {
-			ctx.Error(failure.GoString())
+			ctx.Errorf("%#v", failure)
 		}
 		exitChan <- 2
 		return
 	}
 
 	// then describe the task definition to get a copy of it
-	describeTaskResult, err := svc.DescribeTaskDefinition(&ecs.DescribeTaskDefinitionInput{
+	describeTaskResult, err := svc.DescribeTaskDefinition(context.TODO(), &ecs.DescribeTaskDefinitionInput{
 		TaskDefinition: describeResult.Services[0].TaskDefinition,
 	})
 	if err != nil {
@@ -97,7 +98,7 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	}
 
 	// now, register the new task
-	registerResult, err := svc.RegisterTaskDefinition(&ecs.RegisterTaskDefinitionInput{
+	registerResult, err := svc.RegisterTaskDefinition(context.TODO(), &ecs.RegisterTaskDefinitionInput{
 		ContainerDefinitions:    taskDefinition.ContainerDefinitions,
 		Cpu:                     taskDefinition.Cpu,
 		ExecutionRoleArn:        taskDefinition.ExecutionRoleArn,
@@ -116,7 +117,7 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	}
 	ctx.WithField(
 		"task_definition_arn",
-		aws.StringValue(registerResult.TaskDefinition.TaskDefinitionArn),
+		aws.ToString(registerResult.TaskDefinition.TaskDefinitionArn),
 	).Debug("Registered the task definition")
 
 	// now we are running DescribeService periodically to get the events
@@ -129,22 +130,22 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 		last := time.Now()
 
 		defer wg.Done()
-		svc := ecs.New(localSession)
+		svc := ecs.NewFromConfig(cfg)
 
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		printEvent := func() {
-			describeResult, err := svc.DescribeServices(&ecs.DescribeServicesInput{
+			describeResult, err := svc.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
 				Cluster:  aws.String(cluster),
-				Services: aws.StringSlice([]string{service}),
+				Services: []string{service},
 			})
 			if err != nil {
 				ctx.WithError(err).Error("Can't describe service")
 			}
 			for _, event := range describeResult.Services[0].Events {
-				eventId := aws.StringValue(event.Id)
-				if !aws.TimeValue(event.CreatedAt).Before(last) && !lo.Contains(printedEvents, eventId) {
-					ctx.Info(aws.StringValue(event.Message))
+				eventId := aws.ToString(event.Id)
+				if !aws.ToTime(event.CreatedAt).Before(last) && !lo.Contains(printedEvents, eventId) {
+					ctx.Info(aws.ToString(event.Message))
 					printedEvents = lo.Union(printedEvents, []string{eventId})
 				}
 
@@ -164,9 +165,9 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	// update the service using the new registered task definition
 	err = updateService(
 		ctx,
-		aws.StringValue(describeResult.Services[0].ClusterArn),
-		aws.StringValue(describeResult.Services[0].ServiceArn),
-		aws.StringValue(registerResult.TaskDefinition.TaskDefinitionArn),
+		aws.ToString(describeResult.Services[0].ClusterArn),
+		aws.ToString(describeResult.Services[0].ServiceArn),
+		aws.ToString(registerResult.TaskDefinition.TaskDefinitionArn),
 	)
 
 	wg.Add(1)
@@ -176,13 +177,13 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 		if n, ok := <-rollback; n && ok {
 			ctx.WithField(
 				"task_definition_arn",
-				aws.StringValue(describeResult.Services[0].TaskDefinition),
+				aws.ToString(describeResult.Services[0].TaskDefinition),
 			).Info("Rolling back to the previous task definition")
 			if err := updateService(
 				ctx,
-				aws.StringValue(describeResult.Services[0].ClusterArn),
-				aws.StringValue(describeResult.Services[0].ServiceArn),
-				aws.StringValue(describeResult.Services[0].TaskDefinition),
+				aws.ToString(describeResult.Services[0].ClusterArn),
+				aws.ToString(describeResult.Services[0].ServiceArn),
+				aws.ToString(describeResult.Services[0].TaskDefinition),
 			); err != nil {
 				ctx.WithError(err).Error("Couldn't rollback.")
 			}
@@ -200,9 +201,9 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	}
 
 	// deregister the old task definition
-	ctx = ctx.WithFields(log.Fields{"task_definition_arn": aws.StringValue(deregisterTaskArn)})
+	ctx = ctx.WithFields(log.Fields{"task_definition_arn": aws.ToString(deregisterTaskArn)})
 	ctx.Debug("Deregistered the task definition")
-	_, err = svc.DeregisterTaskDefinition(&ecs.DeregisterTaskDefinitionInput{
+	_, err = svc.DeregisterTaskDefinition(context.TODO(), &ecs.DeregisterTaskDefinitionInput{
 		TaskDefinition: deregisterTaskArn,
 	})
 	if err != nil {
@@ -211,9 +212,9 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 }
 
 func updateService(ctx log.Interface, cluster, service, taskDefinition string) error {
-	svc := ecs.New(localSession)
+	svc := ecs.NewFromConfig(cfg)
 	// update the service using the new registered task definition
-	_, err := svc.UpdateService(&ecs.UpdateServiceInput{
+	_, err := svc.UpdateService(context.TODO(), &ecs.UpdateServiceInput{
 		Cluster:        aws.String(cluster),
 		Service:        aws.String(service),
 		TaskDefinition: aws.String(taskDefinition),
@@ -223,10 +224,13 @@ func updateService(ctx log.Interface, cluster, service, taskDefinition string) e
 		return err
 	}
 	ctx.Info("Updated the service")
-	err = svc.WaitUntilServicesStable(&ecs.DescribeServicesInput{
+	waiter := ecs.NewServicesStableWaiter(svc)
+	err = waiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
 		Cluster:  aws.String(cluster),
-		Services: []*string{aws.String(service)},
-	})
+		Services: []string{service},
+	},
+		10*time.Minute, // max wait
+	)
 	if err != nil {
 		ctx.WithError(err).Error("The waiter has been finished with an error")
 		return err

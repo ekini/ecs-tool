@@ -2,8 +2,6 @@ package lib
 
 import (
 	"testing"
-
-	"github.com/aws/aws-sdk-go/aws"
 )
 
 var testdata = map[string]string{
@@ -13,7 +11,7 @@ var testdata = map[string]string{
 
 func TestParseTaskUUID(t *testing.T) {
 	for testArn, uuid := range testdata {
-		if parsedUUID, err := parseTaskUUID(aws.String(testArn)); err != nil {
+		if parsedUUID, err := parseTaskUUID(testArn); err != nil {
 			t.Fatalf("Can't parse this ARN '%s': %s", testArn, err)
 		} else {
 			if parsedUUID == uuid {
