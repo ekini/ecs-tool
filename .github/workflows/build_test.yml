@@ -14,7 +14,7 @@ jobs:
       - name: set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 1.18.x
+          go-version: 1.21.x
       - name: download dependencies
         run: go mod download
       - name: build the app
