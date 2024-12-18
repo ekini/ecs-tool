@@ -3,17 +3,20 @@ package lib
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/apex/log"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/samber/lo"
 )
 
 // DeployServices deploys specified services in parallel
-func DeployServices(profile, cluster, imageTag string, imageTags, services []string, workDir string, rollbackOnFail bool) (exitCode int, err error) {
+func DeployServices(profile, cluster, imageTag string, imageTags, services []string, workDir string, rollbackOnFail, eagerDeployment bool) (exitCode int, err error) {
 	ctx := log.WithFields(log.Fields{
 		"cluster":   cluster,
 		"image_tag": imageTag,
@@ -32,7 +35,7 @@ func DeployServices(profile, cluster, imageTag string, imageTags, services []str
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			deployService(ctx, cluster, imageTag, imageTags, workDir, service, exits, rollback, &wg)
+			deployService(ctx, cluster, imageTag, imageTags, workDir, service, exits, rollback, eagerDeployment, &wg)
 		}()
 	}
 
@@ -54,7 +57,7 @@ func DeployServices(profile, cluster, imageTag string, imageTags, services []str
 	return
 }
 
-func deployService(ctx log.Interface, cluster, imageTag string, imageTags []string, workDir, service string, exitChan chan int, rollback chan bool, wg *sync.WaitGroup) {
+func deployService(ctx log.Interface, cluster, imageTag string, imageTags []string, workDir, service string, exitChan chan int, rollback chan bool, eagerDeployment bool, wg *sync.WaitGroup) {
 	ctx = ctx.WithFields(log.Fields{
 		"service": service,
 	})
@@ -168,6 +171,7 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 		aws.ToString(describeResult.Services[0].ClusterArn),
 		aws.ToString(describeResult.Services[0].ServiceArn),
 		aws.ToString(registerResult.TaskDefinition.TaskDefinitionArn),
+		eagerDeployment,
 	)
 
 	wg.Add(1)
@@ -184,6 +188,7 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 				aws.ToString(describeResult.Services[0].ClusterArn),
 				aws.ToString(describeResult.Services[0].ServiceArn),
 				aws.ToString(describeResult.Services[0].TaskDefinition),
+				eagerDeployment,
 			); err != nil {
 				ctx.WithError(err).Error("Couldn't rollback.")
 			}
@@ -211,10 +216,10 @@ func deployService(ctx log.Interface, cluster, imageTag string, imageTags []stri
 	}
 }
 
-func updateService(ctx log.Interface, cluster, service, taskDefinition string) error {
+func updateService(ctx log.Interface, cluster, service, taskDefinition string, eagerDeployment bool) error {
 	svc := ecs.NewFromConfig(cfg)
 	// update the service using the new registered task definition
-	_, err := svc.UpdateService(context.TODO(), &ecs.UpdateServiceInput{
+	out, err := svc.UpdateService(context.TODO(), &ecs.UpdateServiceInput{
 		Cluster:        aws.String(cluster),
 		Service:        aws.String(service),
 		TaskDefinition: aws.String(taskDefinition),
@@ -224,18 +229,115 @@ func updateService(ctx log.Interface, cluster, service, taskDefinition string) e
 		return err
 	}
 	ctx.Info("Updated the service")
-	waiter := ecs.NewServicesStableWaiter(svc)
-	err = waiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
-		Cluster:  aws.String(cluster),
-		Services: []string{service},
-	},
-		10*time.Minute, // max wait
-	)
-	if err != nil {
-		ctx.WithError(err).Error("The waiter has been finished with an error")
-		return err
+
+	if eagerDeployment {
+		if err := waitUntilDeploymentIsActive(ctx, out); err != nil {
+			ctx.WithError(err).Error("Can't wait until service is deployed")
+			return err
+		}
+	} else {
+		waiter := ecs.NewServicesStableWaiter(svc)
+		err = waiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
+			Cluster:  aws.String(cluster),
+			Services: []string{service},
+		},
+			10*time.Minute, // max wait
+		)
+		if err != nil {
+			ctx.WithError(err).Error("The waiter has been finished with an error")
+			return err
+		}
 	}
 
 	ctx.Info("Service has been deployed")
 	return nil
+}
+
+func waitUntilDeploymentIsActive(ctx log.Interface, updateServiceOutput *ecs.UpdateServiceOutput) error {
+	svc := ecs.NewFromConfig(cfg)
+	serviceConfigurations := updateServiceOutput.Service.Deployments
+	// sort deployments to get the latest one
+	sort.SliceStable(serviceConfigurations, func(i, j int) bool {
+		return serviceConfigurations[i].CreatedAt.After(aws.ToTime(serviceConfigurations[j].CreatedAt))
+	})
+
+	// AWS is weird about output of service update
+	// one would expect something that can be used to poll for status right away, but no
+	// The output has "deployments", which is a list of task sets, i.e.
+	// "ecs-svc/3130987122852940733" - PRIMARY - IN_PROGRESS
+	// "ecs-svc/1201712472044336203" - ACTIVE - COMPLETED
+	// which is in fact a service configuration revisions
+	//
+	// The actual deployment to apply that service configuration is retrieved by a different API call and does
+	// appear a bit later, not instantly
+	//
+	deploymentArn, err := func(cluster, service *string, createdAt *time.Time, serviceConfigurationId string) (string, error) {
+		for i := 1; i <= 12; i++ {
+			ctx.Info("Polling deployments...")
+			out, err := svc.ListServiceDeployments(context.TODO(), &ecs.ListServiceDeploymentsInput{
+				Cluster: cluster,
+				Service: service,
+				CreatedAt: &types.CreatedAt{
+					After: aws.Time(createdAt.Add(time.Duration(-1) * time.Minute)),
+					// Before: aws.Time(time.Now()),
+				},
+			})
+			if err != nil {
+				return "", err
+			}
+			for _, deployment := range out.ServiceDeployments {
+				// split target revision arn by '/' to take just its id
+				bits := strings.Split(aws.ToString(deployment.TargetServiceRevisionArn), "/")
+				// compare the revision we have with the one deploying
+				deploymentId := bits[len(bits)-1] // last element
+				if strings.Split(serviceConfigurationId, "/")[1] == deploymentId {
+					arn := aws.ToString(deployment.ServiceDeploymentArn)
+					ctx.Infof("Found deployment ARN '%s'", arn)
+					return arn, nil
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+
+		return "", fmt.Errorf("timeout when retrieving deployment with service configuration %s", serviceConfigurationId)
+	}(
+		updateServiceOutput.Service.ClusterArn,
+		updateServiceOutput.Service.ServiceArn,
+		serviceConfigurations[0].CreatedAt,
+		*serviceConfigurations[0].Id,
+	)
+	if err != nil {
+		ctx.WithError(err).Error("Can't find deployment")
+		return err
+	}
+
+	err = func(deploymentArn string) error {
+		for i := 1; i <= 60; i++ {
+			out, err := svc.DescribeServiceDeployments(context.TODO(), &ecs.DescribeServiceDeploymentsInput{
+				ServiceDeploymentArns: []string{deploymentArn},
+			})
+			if err != nil {
+				return err
+			}
+			status := out.ServiceDeployments[0].Status
+
+			if status == types.ServiceDeploymentStatusSuccessful {
+				// all good
+				ctx.Infof("Deployment '%s' is complete", deploymentArn)
+				return nil
+			}
+
+			if !(status == types.ServiceDeploymentStatusPending || status == types.ServiceDeploymentStatusInProgress) {
+				return fmt.Errorf("Deployment is in '%s' status (%s)", status, aws.ToString(out.ServiceDeployments[0].StatusReason))
+			}
+			if i%3 == 0 { // print every 3rd
+				ctx.Infof("Deployment is in %s", status)
+			}
+			time.Sleep(10 * time.Second)
+		}
+		return fmt.Errorf("timeout waiting for the deployment to complete")
+	}(
+		deploymentArn,
+	)
+	return err
 }

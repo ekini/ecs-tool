@@ -18,9 +18,9 @@ import (
 	"os"
 
 	"github.com/apex/log"
+	"github.com/ekini/ecs-tool/lib"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/springload/ecs-tool/lib"
 )
 
 // deployCmd represents the deploy command
@@ -45,6 +45,7 @@ If deployment failed, then rolls back to the previous stack definition.`,
 			viper.GetStringSlice("deploy.services"),
 			viper.GetString("workdir"),
 			!viper.GetBool("no_rollback"),
+			viper.GetBool("eager_deployment"),
 		)
 		if err != nil {
 			log.WithError(err).Errorf("Deployment failed with code %d", exitCode)
@@ -61,6 +62,10 @@ func init() {
 	}
 	deployCmd.PersistentFlags().BoolP("no-rollback", "", false, "Do not rollback when a deployment fails. ECS has its own mechanisms now.")
 	if err := viper.BindPFlag("no_rollback", deployCmd.PersistentFlags().Lookup("no-rollback")); err != nil {
+		log.WithError(err).Fatal("can't bind flag to config")
+	}
+	deployCmd.PersistentFlags().BoolP("eager-deployment", "", false, "[Experimental] Only wait until the current deployment is successfull. Otherwise waits until the ECS service is stable")
+	if err := viper.BindPFlag("eager_deployment", deployCmd.PersistentFlags().Lookup("no-rollback")); err != nil {
 		log.WithError(err).Fatal("can't bind flag to config")
 	}
 }

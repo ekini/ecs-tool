@@ -1,6 +1,6 @@
 package main
 
-import "github.com/springload/ecs-tool/cmd"
+import "github.com/ekini/ecs-tool/cmd"
 
 var version = "dev"
 

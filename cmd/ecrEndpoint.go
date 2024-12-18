@@ -5,7 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/springload/ecs-tool/lib"
+	"github.com/ekini/ecs-tool/lib"
 )
 
 // ecrEndpointCmd represents the ecrEndpoint command

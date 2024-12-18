@@ -1,4 +1,4 @@
-module github.com/springload/ecs-tool
+module github.com/ekini/ecs-tool
 
 go 1.21
 
