@@ -58,6 +58,10 @@ func printCloudWatchLogs(logGroup, streamName string) error {
 		if err != nil {
 			return err
 		}
+		// No events means we're done
+		if len(page.Events) == 0 {
+			break
+		}
 		for _, event := range page.Events {
 			fmt.Println(aws.ToString(event.Message))
 		}
